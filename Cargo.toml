@@ -1,0 +1,12 @@
+[package]
+name = "eadb"
+version = "0.1.0"
+authors = ["Alex Angelini <alex.louis.angelini@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+bitvec = "0.13"
+byteorder = "1"
+lru = "0.1.16"
+snap = "0.2.5"
+uuid = { version = "0.7", features = ["v4"] }
