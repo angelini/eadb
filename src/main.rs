@@ -1,257 +1,14 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::File;
 use std::io;
-use std::io::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use bitvec::prelude as bv;
-use bitvec::vec::BitVec;
-use byteorder;
-use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt};
 use env_logger;
-use log::debug;
 use lru::LruCache;
-use snap;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum Type {
-    Bool,
-    Int,
-    Float,
-    String,
-}
+mod page;
 
-#[derive(Clone)]
-struct Bound<T: PartialOrd> {
-    min: T,
-    max: T,
-}
-
-struct PageData {
-    bytes: Vec<u8>,
-    nulls: BitVec<bv::LittleEndian, u8>,
-    offsets: Vec<usize>,
-    typ: Type,
-}
-
-impl PageData {
-    fn from_bools(data: &[Option<bool>]) -> io::Result<PageData> {
-        let mut bits = BitVec::<bv::LittleEndian, u8>::new();
-        let mut nulls = BitVec::new();
-
-        for entry in data.iter() {
-            bits.push(entry.unwrap_or(false));
-            nulls.push(entry.is_none());
-        }
-        Ok(PageData {
-            bytes: bits.as_slice().to_vec(),
-            nulls: nulls,
-            offsets: vec![],
-            typ: Type::Bool,
-        })
-    }
-
-    fn from_ints(data: &[Option<i64>]) -> io::Result<PageData> {
-        let mut bytes = vec![];
-        let mut nulls = BitVec::new();
-
-        for entry in data.iter() {
-            bytes.write_i64::<byteorder::LittleEndian>(entry.unwrap_or(0))?;
-            nulls.push(entry.is_none());
-        }
-        Ok(PageData {
-            bytes: bytes,
-            nulls: nulls,
-            offsets: vec![],
-            typ: Type::Int,
-        })
-    }
-
-    fn from_floats(data: &[Option<f64>]) -> io::Result<PageData> {
-        let mut nulls = BitVec::new();
-        let mut bytes = vec![];
-        for entry in data.iter() {
-            nulls.push(entry.is_none());
-            bytes.write_f64::<byteorder::LittleEndian>(entry.unwrap_or(0.0))?;
-        }
-        Ok(PageData {
-            bytes: bytes,
-            nulls: nulls,
-            offsets: vec![],
-            typ: Type::Float,
-        })
-    }
-
-    fn from_strings(data: &[Option<&str>]) -> io::Result<PageData> {
-        let mut bytes = vec![];
-        let mut nulls = BitVec::new();
-        let mut offset = 0;
-        let mut offsets = vec![];
-
-        for entry in data.iter() {
-            let value = entry.unwrap_or("");
-            bytes.extend(value.bytes());
-            nulls.push(entry.is_none());
-            offsets.push(offset);
-            offset += value.len();
-        }
-        offsets.push(offset);
-
-        Ok(PageData {
-            bytes: bytes,
-            nulls: nulls,
-            offsets: offsets,
-            typ: Type::String,
-        })
-    }
-
-    fn len(&self) -> usize {
-        self.nulls.len()
-    }
-
-    fn get_bool(&self, idx: usize) -> Option<bool> {
-        if self.nulls[idx] {
-            None
-        } else {
-            let bits = BitVec::<bv::LittleEndian, u8>::from_slice(&self.bytes);
-            bits.get(idx)
-        }
-    }
-
-    fn get_int(&self, idx: usize) -> Option<i64> {
-        if self.nulls[idx] {
-            None
-        } else {
-            let mut slice = self.bytes.get(idx * 8..(idx + 1) * 8).unwrap();
-            Some(slice.read_i64::<byteorder::LittleEndian>().unwrap())
-        }
-    }
-
-    fn get_float(&self, idx: usize) -> Option<f64> {
-        if self.nulls[idx] {
-            None
-        } else {
-            let mut slice = self.bytes.get(idx * 8..(idx + 1) * 8).unwrap();
-            Some(slice.read_f64::<byteorder::LittleEndian>().unwrap())
-        }
-    }
-
-    fn get_string(&self, idx: usize) -> Option<String> {
-        if self.nulls[idx] {
-            None
-        } else {
-            let slice = self
-                .bytes
-                .get(self.offsets[idx]..self.offsets[idx + 1])
-                .unwrap();
-            Some(String::from_utf8(slice.to_vec()).unwrap())
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct PageStats {
-    contains_nulls: bool,
-    int_bound: Option<Bound<usize>>,
-    float_bound: Option<Bound<f64>>,
-    string_bound: Option<Bound<String>>,
-}
-
-#[derive(Clone)]
-struct PageMeta {
-    id: Uuid,
-    offset: usize,
-    path: PathBuf,
-    size: usize,
-    stats: PageStats,
-    typ: Type,
-}
-
-impl PageMeta {
-    fn new(typ: Type, path: &Path, offset: usize, size: usize) -> Self {
-        PageMeta {
-            id: Uuid::new_v4(),
-            offset: offset,
-            path: path.to_path_buf(),
-            size: size,
-            stats: PageStats::default(),
-            typ: typ,
-        }
-    }
-
-    fn load_page(&self) -> io::Result<PageData> {
-        debug!("loading page: {:?}", self.path);
-        let mut file = File::open(&self.path)?;
-
-        let mut size_bytes = [0; 8];
-        file.read(&mut size_bytes)?;
-        let size = byteorder::LittleEndian::read_u64(&size_bytes);
-
-        let mut null_bytes = vec![0; size as usize];
-        file.read(&mut null_bytes)?;
-        let nulls = BitVec::from_slice(&null_bytes);
-
-        let mut offsets = vec![];
-        if self.typ == Type::String {
-            let mut offset_bytes = vec![0; (self.size + 1) * 8];
-            file.read(&mut offset_bytes)?;
-            offsets = offset_bytes
-                .chunks(8)
-                .map(|word| byteorder::LittleEndian::read_u64(word) as usize)
-                .collect();
-        }
-
-        let mut bytes = vec![];
-        let mut decompressed_file = snap::Reader::new(file);
-        decompressed_file.read_to_end(&mut bytes)?;
-
-        Ok(PageData {
-            bytes: bytes,
-            nulls: nulls,
-            offsets: offsets,
-            typ: self.typ,
-        })
-    }
-}
-
-type PageKey = (Uuid, usize);
-
-struct Page {
-    data: PageData,
-    meta: PageMeta,
-}
-
-impl Page {
-    fn get_bool(&self, idx: usize) -> Option<bool> {
-        assert!(self.meta.typ == Type::Bool);
-        self.data.get_bool(idx)
-    }
-
-    fn get_int(&self, idx: usize) -> Option<i64> {
-        assert!(self.meta.typ == Type::Int);
-        self.data.get_int(idx)
-    }
-
-    fn get_float(&self, idx: usize) -> Option<f64> {
-        assert!(self.meta.typ == Type::Float);
-        self.data.get_float(idx)
-    }
-
-    fn get_string(&self, idx: usize) -> Option<String> {
-        assert!(self.meta.typ == Type::String);
-        self.data.get_string(idx)
-    }
-}
-
-impl Page {
-    fn new(meta: &PageMeta, data: PageData) -> Self {
-        Page {
-            data: data,
-            meta: meta.clone(),
-        }
-    }
-}
+use page::{Page, PageData, PageKey, PageMeta, PageReader, PageWriter, Type};
 
 struct PageCache {
     pages: LruCache<PageKey, Page>,
@@ -268,8 +25,7 @@ impl PageCache {
 
     fn get(&mut self, key: &PageKey, meta: &PageMeta) -> io::Result<&Page> {
         if !self.pages.contains(key) {
-            let data = meta.load_page()?;
-            self.pages.put(key.clone(), Page::new(meta, data));
+            self.pages.put(key.clone(), PageReader::read(&meta)?);
         }
         Ok(self.pages.get(key).unwrap())
     }
@@ -481,58 +237,21 @@ impl<'a> Iterator for CollectionStringIter<'a> {
     }
 }
 
-struct PageWriter {}
-
-impl PageWriter {
-    fn write(path: &Path, offset: usize, data: &PageData) -> io::Result<PageMeta> {
-        let meta = PageMeta::new(data.typ, path, offset, data.len());
-        let mut file = File::create(path)?;
-
-        PageWriter::write_nulls(&mut file, &data)?;
-        PageWriter::write_offsets(&mut file, &data)?;
-
-        let mut compressed_file = snap::Writer::new(file);
-        compressed_file.write_all(&data.bytes).unwrap();
-
-        Ok(meta)
-    }
-
-    fn write_nulls(file: &mut File, data: &PageData) -> io::Result<()> {
-        let nulls_slice = data.nulls.as_slice();
-
-        let mut size_bytes = [0; 8];
-        byteorder::LittleEndian::write_u64(&mut size_bytes, nulls_slice.len() as u64);
-
-        file.write_all(&size_bytes)?;
-        file.write_all(data.nulls.as_slice())?;
-
-        Ok(())
-    }
-
-    fn write_offsets(file: &mut File, data: &PageData) -> io::Result<()> {
-        let mut bytes = [0; 8];
-        for offset in &data.offsets {
-            byteorder::LittleEndian::write_u64(&mut bytes, *offset as u64);
-            file.write(&bytes)?;
-        }
-        Ok(())
-    }
-}
-
 fn test_bools(cache: &mut PageCache) -> io::Result<()> {
     let page_metas = vec![
-        PageWriter::write(
-            Path::new("./example/bool_1"),
-            0,
-            &PageData::from_bools(&[Some(true), None, Some(true)])?,
-        )?,
-        PageWriter::write(
-            Path::new("./example/bool_2"),
-            3,
-            &PageData::from_bools(&[None, Some(false), Some(false)])?,
-        )?,
+        PageMeta::new(Type::Bool, &Path::new("./example/bool_1"), 0, 3),
+        PageMeta::new(Type::Bool, &Path::new("./example/bool_2"), 3, 3),
     ];
+
+    let pages = [
+        Page::new(&page_metas[0], PageData::from_bools(&[Some(true), None, Some(true)])?),
+        Page::new(&page_metas[1], PageData::from_bools(&[None, Some(false), Some(false)])?),
+    ];
+
     let collection = Collection::new(page_metas);
+
+    PageWriter::write(&pages[0])?;
+    PageWriter::write(&pages[1])?;
 
     println!("0: {:?}", collection.get_bool(cache, 0));
     println!("1: {:?}", collection.get_bool(cache, 1));
@@ -550,18 +269,19 @@ fn test_bools(cache: &mut PageCache) -> io::Result<()> {
 
 fn test_ints(cache: &mut PageCache) -> io::Result<()> {
     let page_metas = vec![
-        PageWriter::write(
-            Path::new("./example/int_1"),
-            0,
-            &PageData::from_ints(&[Some(2), None, Some(4)])?,
-        )?,
-        PageWriter::write(
-            Path::new("./example/int_2"),
-            3,
-            &PageData::from_ints(&[None, Some(6), None])?,
-        )?,
+        PageMeta::new(Type::Int, &Path::new("./example/int_1"), 0, 3),
+        PageMeta::new(Type::Int, &Path::new("./example/int_2"), 3, 3),
     ];
+
+    let pages = [
+        Page::new(&page_metas[0], PageData::from_ints(&[Some(2), None, Some(4)])?),
+        Page::new(&page_metas[0], PageData::from_ints(&[None, Some(6), None])?),
+    ];
+
     let collection = Collection::new(page_metas);
+
+    PageWriter::write(&pages[0])?;
+    PageWriter::write(&pages[1])?;
 
     println!("0: {:?}", collection.get_int(cache, 0));
     println!("1: {:?}", collection.get_int(cache, 1));
@@ -579,18 +299,19 @@ fn test_ints(cache: &mut PageCache) -> io::Result<()> {
 
 fn test_floats(cache: &mut PageCache) -> io::Result<()> {
     let page_metas = vec![
-        PageWriter::write(
-            Path::new("./example/float_1"),
-            0,
-            &PageData::from_floats(&[Some(1.2), None, Some(4.5)])?,
-        )?,
-        PageWriter::write(
-            Path::new("./example/float_2"),
-            3,
-            &PageData::from_floats(&[None, Some(-6.1), None])?,
-        )?,
+        PageMeta::new(Type::Float, &Path::new("./example/float_1"), 0, 3),
+        PageMeta::new(Type::Float, &Path::new("./example/float_2"), 3, 3),
     ];
+
+    let pages = vec![
+        Page::new(&page_metas[0], PageData::from_floats(&[Some(1.2), None, Some(4.5)])?),
+        Page::new(&page_metas[1], PageData::from_floats(&[None, Some(-6.1), None])?),
+    ];
+
     let collection = Collection::new(page_metas);
+
+    PageWriter::write(&pages[0])?;
+    PageWriter::write(&pages[1])?;
 
     println!("0: {:?}", collection.get_float(cache, 0));
     println!("1: {:?}", collection.get_float(cache, 1));
@@ -608,18 +329,19 @@ fn test_floats(cache: &mut PageCache) -> io::Result<()> {
 
 fn test_strings(cache: &mut PageCache) -> io::Result<()> {
     let page_metas = vec![
-        PageWriter::write(
-            Path::new("./example/string_1"),
-            0,
-            &PageData::from_strings(&[Some("abc"), None, Some("def")])?,
-        )?,
-        PageWriter::write(
-            Path::new("./example/string_2"),
-            3,
-            &PageData::from_strings(&[None, Some(""), None])?,
-        )?,
+        PageMeta::new(Type::String, &Path::new("./example/string_1"), 0, 3),
+        PageMeta::new(Type::String, &Path::new("./example/string_2"), 3, 3),
     ];
+
+    let pages = [
+        Page::new(&page_metas[0], PageData::from_strings(&[Some("abc"), None, Some("def")])?),
+        Page::new(&page_metas[1], PageData::from_strings(&[None, Some(""), None])?),
+    ];
+
     let collection = Collection::new(page_metas);
+
+    PageWriter::write(&pages[0])?;
+    PageWriter::write(&pages[1])?;
 
     println!("0: {:?}", collection.get_string(cache, 0));
     println!("1: {:?}", collection.get_string(cache, 1));
